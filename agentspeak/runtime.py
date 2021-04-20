@@ -32,6 +32,8 @@ import agentspeak.util
 
 from agentspeak import UnaryOp, BinaryOp, AslError, asl_str
 
+from stag_logger.Logger import Logger
+
 
 LOGGER = agentspeak.get_logger(__name__)
 
@@ -102,7 +104,7 @@ class BuildQueryVisitor:
         try:
             arity = len(ast_literal.terms)
             action_impl = self.actions.lookup(ast_literal.functor, arity)
-            return ActionQuery(term, action_impl)
+            return ActionQuery(term, action_impl, ast_literal.loc)
         except KeyError:
             if "." in ast_literal.functor:
                 self.log.warning("no such action '%s/%d'", ast_literal.functor, arity,
@@ -176,12 +178,35 @@ class FalseQuery:
 
 
 class ActionQuery:
-    def __init__(self, term, impl):
+    #fahid:
+    # extended to contain line of code....
+    def __init__(self, term, impl,  loc="Unknown"):
         self.term = term
         self.impl = impl
+        self.loc = loc
+
+    def _get_readable_name(self):
+        readable_name =  str(self.term)
+        if "(" in readable_name:
+            return readable_name.split("(")[0]
+        return readable_name
+
 
     def execute(self, agent, intention):
         for _ in self.impl(agent, self.term, intention):
+            #fahid: log action
+
+
+
+            Logger.log_action(
+                agent=agent.name.localpart,
+                payload={
+                    "IDENTIFIER": self._get_readable_name(),
+                    "CODE_LINE": self.loc.lineno,
+                    "CODE_FILE": self.loc.filename
+                },
+                bb_payload=agent.get_belief_base()
+            )
             yield
 
 
@@ -305,6 +330,8 @@ class Plan:
         return "%s%s%s" % (self.trigger.value, self.goal_type.value, self.head)
 
 
+
+
 class Event:
     def __init__(self, trigger, goal_type, head):
         self.trigger = trigger
@@ -348,6 +375,32 @@ class Agent:
         self.plans = collections.defaultdict(lambda: []) if plans is None else plans
 
         self.intentions = collections.deque()
+
+    def _extract_sender_name (self, source_string):
+
+        if "@" in source_string:
+            source_string =  source_string.split("@")[0]
+
+        return source_string.replace("source", "")\
+                .replace("\"", "").replace("(", "")\
+                .replace(")", "").replace("]", "")
+
+
+
+    def get_belief_base(self):
+        b_base = []
+        for beliefs in self.beliefs.values():
+            for belief in beliefs:
+                parts = str(belief).split("[")
+                belief_term = parts[0]
+                source = "self" if len(parts) <= 1 else self._extract_sender_name(parts[1])
+                b_base.append( {
+                    "source":  source,
+                    "type": "belief",
+                    "value": belief_term
+                })
+
+        return b_base
 
     def dump(self):
         LOGGER.info("Belief base")
@@ -407,13 +460,43 @@ class Agent:
 
             if agentspeak.unifies_annotated(event.head, frozen):
                 intention.waiter = None
-
+        # fahid..... log plan trace here.....
+        self.get_belief_base()
         applicable_plans = self.plans[(trigger, goal_type, frozen.functor, len(frozen.args))]
+        applicable_plans_trace = []
+        for plan in applicable_plans:
+            """
+            if type(plan.context) is list:
+                print (">>>> list")
+            else:
+                print (">>>>> ", type(plan.context))
+                if type(plan.context) is AndQuery:
+                    print(".....")
+                    print(plan.context.left)
+                    print(plan.context.right)
+                elif type(plan.context) is OrQuery:
+                    print("////")
+                    print(plan.context.left)
+
+                    print(plan.context.right)
+            """
+            applicable_plans_trace.append(
+                {
+                "IDENTIFIER": str(plan.head),
+                "CONTEXT": flatten_context(plan.context), #str(plan.context) if type(plan.context) is not type (NotQuery("")) else "not " + str(plan.context.query),
+                "CODE_LINE": "",
+                "CODE_FILE": ""
+                }
+            )
+        if len(applicable_plans_trace) > 0:
+            Logger.log_plan_trace(agent=self.name, payload=applicable_plans_trace, bb_payload=self.get_belief_base())
+
         choicepoint = object()
         intention = Intention()
-
         # Find matching plan.
+        counter = -1
         for plan in applicable_plans:
+            counter += 1
             for _ in agentspeak.unify_annotated(plan.head, frozen, intention.scope, intention.stack):
                 for _ in plan.context.execute(self, intention):
                     intention.head_term = frozen
@@ -424,24 +507,29 @@ class Agent:
                         for intention_stack in self.intentions:
                             if intention_stack[-1] == calling_intention:
                                 intention_stack.append(intention)
+                                # Fahid: log selected plan....
+                                Logger.log_plan_selection(agent=self.name, payload=applicable_plans_trace[counter], bb_payload=self.get_belief_base())
                                 return True
 
                     new_intention_stack = collections.deque()
                     new_intention_stack.append(intention)
                     self.intentions.append(new_intention_stack)
+                    # Fahid: Log selected plan.....
+                    Logger.log_plan_selection(agent=self.name, payload=applicable_plans_trace[counter],bb_payload=self.get_belief_base())
                     return True
 
+        #fahid: log not found...
         if goal_type == agentspeak.GoalType.achievement:
             raise AslError("no applicable plan for %s%s%s/%d" % (
                 trigger.value, goal_type.value, frozen.functor, len(frozen.args)))
         elif goal_type == agentspeak.GoalType.test:
             return self.test_belief(term, calling_intention)
 
+
         return True
 
     def add_belief(self, term, scope):
         term = term.grounded(scope)
-
         if term.functor is None:
             raise AslError("expected belief literal")
 
@@ -512,6 +600,7 @@ class Agent:
             return False
 
         instr = intention.instr
+        #fahid
 
         if not instr:
             intention_stack.pop()
@@ -526,6 +615,7 @@ class Agent:
 
         try:
             if instr.f(self, intention):
+                #fahid.... note....
                 intention.instr = instr.success
             else:
                 intention.instr = instr.failure
@@ -875,6 +965,21 @@ def dump_variables(variables, scope):
 
     if not_in_scope:
         print("%d unbound: %s" % (len(not_in_scope), ", ".join(not_in_scope)))
+
+"""
+ Note: added by Fahid to help extract context info
+ todo: expand to keep relationship...
+"""
+def flatten_context(plan_context):
+    all_context = []
+    if type(plan_context) in [AndQuery, OrQuery]:
+        all_context.extend(flatten_context(plan_context.left))
+        all_context.extend(flatten_context(plan_context.right))
+    elif type(plan_context) is NotQuery:
+        all_context.append("not " + str(plan_context.query))
+    else:
+        all_context.append(str(plan_context))
+    return all_context
 
 
 def repl(agent, env, actions):
